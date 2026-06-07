@@ -1344,20 +1344,34 @@ async function checkUpdates() {
   }
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+
+  // Fork policy: track RELEASE TAGS, not the daily-moving `main` HEAD. Upstream
+  // pushes commits to main every day; comparing against main HEAD would nag
+  // "update available" constantly. We only consider a real new release (a new
+  // version tag like v2026.6.5). When no tags are reachable we fall back to the
+  // branch HEAD so the updater still works against forks/branches without tags.
+  await runGit(['fetch', '--quiet', '--tags', 'origin'], { cwd: updateRoot })
+  const latestTag = (await git(['tag', '-l', 'v*', '--sort=-version:refname']))
+    .split('\n')
+    .map(s => s.trim())
+    .filter(Boolean)[0] || ''
+  const targetRef = latestTag || `origin/${branch}`
+
   const [currentSha, targetSha, countStr, dirtyStr, currentBranch] = await Promise.all([
     git(['rev-parse', 'HEAD']),
-    git(['rev-parse', `origin/${branch}`]),
-    git(['rev-list', `HEAD..origin/${branch}`, '--count']),
+    git(['rev-parse', targetRef]),
+    git(['rev-list', `HEAD..${targetRef}`, '--count']),
     git(['status', '--porcelain']),
     git(['rev-parse', '--abbrev-ref', 'HEAD'])
   ])
 
   const behind = Number.parseInt(countStr, 10) || 0
-  const commits = behind > 0 ? await readCommitLog(updateRoot, branch) : []
+  const commits = behind > 0 ? await readCommitLog(updateRoot, targetRef) : []
 
   return {
     supported: true,
     branch,
+    releaseTag: latestTag || null,
     currentBranch,
     behind,
     currentSha,
@@ -1369,11 +1383,11 @@ async function checkUpdates() {
   }
 }
 
-async function readCommitLog(cwd, branch) {
+async function readCommitLog(cwd, targetRef) {
   const SEP = '\x1f'
   const REC = '\x1e'
   const { stdout } = await runGit(
-    ['log', `HEAD..origin/${branch}`, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', '40'],
+    ['log', `HEAD..${targetRef}`, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', '40'],
     { cwd }
   )
 

@@ -85,27 +85,35 @@ if [ "$CUR_BRANCH" != "$BRANCH" ]; then
   git checkout "$BRANCH"
 fi
 
-# ── 2 & 3. 拉取 + 合并官方 ───────────────────────────────────────────────────
+# ── 2 & 3. 拉取 + 合并官方【最新 release tag】────────────────────────────────
+# 只跟版本(tag),不跟 main 的每日 commit。官方天天往 main 推,跟 main 会天天落后;
+# 只在官方真正发布新版本(v2026.x.x 这种 tag)时才合并、才需要重打包。
 if [ "$DO_MERGE" = "1" ]; then
-  log "拉取官方 upstream/main"
-  git fetch upstream main
+  log "拉取官方 tags"
+  git fetch --tags --quiet upstream
 
-  BEFORE="$(git rev-parse HEAD)"
-  log "合并 upstream/main"
-  if ! git merge --no-edit upstream/main; then
-    warn "合并冲突,冲突文件如下:"
-    git diff --name-only --diff-filter=U | sed 's/^/    /'
-    echo
-    warn "脚本已停。请人工解决冲突(尤其留意下面这些改动项),解决并 commit 后,"
-    warn "用 --no-merge 重跑本脚本即可继续打包:"
-    printf '    %s\n' "${OUR_FILES[@]}"
-    exit 2
+  LATEST_TAG="$(git tag -l 'v*' --sort=-version:refname | head -1)"
+  if [ -z "$LATEST_TAG" ]; then
+    die "没拉到任何官方 release tag(v*),无法按版本合并。"
   fi
-  AFTER="$(git rev-parse HEAD)"
-  if [ "$BEFORE" != "$AFTER" ]; then
-    log "已合并新提交: $BEFORE → $AFTER"
+  log "官方最新 release tag: $LATEST_TAG"
+
+  # 已经包含这个 tag 就无需重合(我们 >= 最新发布版)。
+  if git merge-base --is-ancestor "$LATEST_TAG" HEAD 2>/dev/null; then
+    log "已包含 $LATEST_TAG,无需合并(已是最新发布版)"
   else
-    log "已是最新,无新提交"
+    BEFORE="$(git rev-parse HEAD)"
+    log "合并 $LATEST_TAG"
+    if ! git merge --no-edit "$LATEST_TAG"; then
+      warn "合并冲突,冲突文件如下:"
+      git diff --name-only --diff-filter=U | sed 's/^/    /'
+      echo
+      warn "脚本已停。请人工解决冲突(尤其留意下面这些改动项),解决并 commit 后,"
+      warn "用 --no-merge 重跑本脚本即可继续打包:"
+      printf '    %s\n' "${OUR_FILES[@]}"
+      exit 2
+    fi
+    log "已合并到发布版 $LATEST_TAG: $BEFORE → $(git rev-parse HEAD)"
   fi
 fi
 
