@@ -1895,6 +1895,120 @@ function writeBootstrapMarker(payload) {
   return merged
 }
 
+// ---------------------------------------------------------------------------
+// Offline bundled-runtime install (self-contained build)
+// ---------------------------------------------------------------------------
+// A packaged build MAY ship the entire Hermes runtime under
+// resources/hermes-runtime:
+//   - source/         the hermes-agent checkout (no .git/venv)
+//   - python/         a relocatable standalone CPython (python-build-standalone)
+//   - site-packages/  a prebuilt site-packages tree (all deps already resolved)
+//   - COMMIT, BRANCH  provenance for the bootstrap-complete marker
+//
+// When present, we materialize it into ACTIVE_HERMES_ROOT with ZERO network
+// (no GitHub clone, no PyPI) instead of running the online install.sh. This is
+// what turns the installer into "install and run" with no downloads.
+//
+// Returns true if it installed (or an install already exists); false if there
+// is no bundle to install (caller then falls back to the online bootstrap).
+function bundledRuntimeDir() {
+  if (!process.resourcesPath) return null
+  const dir = path.join(process.resourcesPath, 'hermes-runtime')
+  return directoryExists(dir) ? dir : null
+}
+
+function readBundledProvenance(dir) {
+  const read = name => {
+    try {
+      return fs.readFileSync(path.join(dir, name), 'utf8').trim()
+    } catch {
+      return ''
+    }
+  }
+  const commit = read('COMMIT') || 'bundledruntime0000000000000000000000000000'
+  const branch = read('BRANCH') || 'bundled'
+  return { commit, branch }
+}
+
+async function installBundledRuntime(emit) {
+  const dir = bundledRuntimeDir()
+  if (!dir) return false
+
+  const srcRoot = path.join(dir, 'source')
+  const pyDir = path.join(dir, 'python')
+  const sitePkgs = path.join(dir, 'site-packages')
+  const bundledPython = path.join(pyDir, 'bin', 'python3.11')
+
+  // Sanity: every piece must be present, else fall back to online bootstrap.
+  if (!fileExists(path.join(srcRoot, 'hermes_cli', 'main.py'))) return false
+  if (!fileExists(bundledPython)) return false
+  if (!directoryExists(sitePkgs)) return false
+
+  const send = ev => {
+    try {
+      emit && emit(ev)
+    } catch {
+      void 0
+    }
+  }
+  const stages = [
+    { name: 'copy-source', title: 'Install Hermes Agent', category: 'runtime', needs_user_input: false },
+    { name: 'create-venv', title: 'Create Python environment', category: 'runtime', needs_user_input: false },
+    { name: 'install-deps', title: 'Install Python dependencies', category: 'runtime', needs_user_input: false },
+    { name: 'finalize', title: 'Finish install', category: 'runtime', needs_user_input: false }
+  ]
+  send({ type: 'manifest', stages, protocolVersion: 1 })
+  const stage = (name, state, extra) => send({ type: 'stage', name, state, ...(extra || {}) })
+
+  // 1. Materialize source into ACTIVE_HERMES_ROOT.
+  send({ type: 'log', line: `Installing bundled Hermes runtime into ${ACTIVE_HERMES_ROOT}`, stream: 'stdout' })
+  stage('copy-source', 'running')
+  const t0 = Date.now()
+  fs.mkdirSync(ACTIVE_HERMES_ROOT, { recursive: true })
+  fs.cpSync(srcRoot, ACTIVE_HERMES_ROOT, { recursive: true })
+  stage('copy-source', 'succeeded', { durationMs: Date.now() - t0 })
+
+  // 2. Copy the standalone Python INTO the install root, then create the venv
+  //    from that copy. This makes ACTIVE_HERMES_ROOT completely self-contained:
+  //    the venv's interpreter lives under HERMES_HOME, not inside the .app, so
+  //    the runtime keeps working even if the user moves or deletes the app
+  //    bundle. No system Python is ever required.
+  stage('create-venv', 'running')
+  const t1 = Date.now()
+  const localPython = path.join(ACTIVE_HERMES_ROOT, 'python')
+  fs.rmSync(localPython, { recursive: true, force: true })
+  fs.cpSync(pyDir, localPython, { recursive: true })
+  const localPythonBin = path.join(localPython, 'bin', 'python3.11')
+  try {
+    fs.rmSync(VENV_ROOT, { recursive: true, force: true })
+  } catch {
+    void 0
+  }
+  await new Promise((resolve, reject) => {
+    const child = spawn(localPythonBin, ['-m', 'venv', VENV_ROOT], { stdio: 'ignore' })
+    child.on('error', reject)
+    child.on('exit', code => (code === 0 ? resolve() : reject(new Error(`venv creation exited ${code}`))))
+  })
+  stage('create-venv', 'succeeded', { durationMs: Date.now() - t1 })
+
+  // 3. Overlay the prebuilt site-packages (offline — no pip / no PyPI).
+  stage('install-deps', 'running')
+  const t2 = Date.now()
+  const venvSite = path.join(VENV_ROOT, 'lib', 'python3.11', 'site-packages')
+  fs.mkdirSync(venvSite, { recursive: true })
+  fs.cpSync(sitePkgs, venvSite, { recursive: true })
+  stage('install-deps', 'succeeded', { durationMs: Date.now() - t2 })
+
+  // 4. Write the bootstrap-complete marker so isBootstrapComplete() passes and
+  //    every subsequent launch goes straight to the backend.
+  stage('finalize', 'running')
+  const { commit, branch } = readBundledProvenance(dir)
+  const marker = writeBootstrapMarker({ pinnedCommit: commit, pinnedBranch: branch })
+  stage('finalize', 'succeeded')
+  send({ type: 'complete', marker })
+  return true
+}
+
 function resolveWebDist() {
   const override = process.env.HERMES_DESKTOP_WEB_DIST
   if (override && directoryExists(path.resolve(override))) return path.resolve(override)
@@ -2170,6 +2284,25 @@ async function ensureRuntime(backend) {
   // to a renderer-side install overlay.
   if (backend.kind === 'bootstrap-needed') {
     rememberLog('[bootstrap] no Hermes install found; starting first-launch bootstrap')
+
+    // ── Offline self-contained path ──────────────────────────────────────
+    // If this build ships a bundled runtime (resources/hermes-runtime), install
+    // it with zero network and skip the online installer entirely. On success
+    // the install is bootstrap-complete, so we return the active backend
+    // directly. On any failure we fall through to the online bootstrap below.
+    try {
+      if (bundledRuntimeDir()) {
+        rememberLog('[bundled-runtime] bundled runtime detected; installing offline')
+        const ok = await installBundledRuntime(broadcastBootstrapEvent)
+        if (ok && isBootstrapComplete()) {
+          await advanceBootProgress('runtime.bundled', 'Hermes runtime ready (bundled, offline)', 80)
+          return createActiveBackend(backend.args || [])
+        }
+        rememberLog('[bundled-runtime] offline install did not complete; falling back to online bootstrap')
+      }
+    } catch (err) {
+      rememberLog(`[bundled-runtime] offline install failed: ${(err && err.message) || err}; falling back to online bootstrap`)
+    }
 
     // Eagerly flip the bootstrap UI state to 'active' so the renderer
     // shows the install overlay BEFORE the runner finishes fetching the

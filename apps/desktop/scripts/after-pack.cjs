@@ -22,8 +22,27 @@
 const path = require('node:path')
 
 const { stampExeIdentity } = require('./set-exe-identity.cjs')
+const { execFileSync } = require('node:child_process')
 
 exports.default = async function afterPack(context) {
+  // macOS: electron-builder skips signing when identity is null (no Apple
+  // cert). But an arm64 app — and especially the nested standalone Python under
+  // Resources/hermes-runtime — MUST be at least ad-hoc signed or macOS kills
+  // it on launch. Deep ad-hoc sign here so the produced .app (and the dmg built
+  // from it) runs. Users still clear quarantine once (`xattr -cr <App>`), but
+  // the binaries themselves are valid.
+  if (context.electronPlatformName === 'darwin') {
+    const productName = context.packager?.appInfo?.productFilename || 'Hermes'
+    const appPath = path.join(context.appOutDir, `${productName}.app`)
+    try {
+      execFileSync('codesign', ['--force', '--deep', '--sign', '-', appPath], { stdio: 'ignore' })
+      console.log(`[after-pack] deep ad-hoc signed ${appPath}`)
+    } catch (err) {
+      console.warn(`[after-pack] ad-hoc codesign failed: ${err.message}`)
+    }
+    return
+  }
+
   if (context.electronPlatformName !== 'win32') {
     return
   }

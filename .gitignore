@@ -123,3 +123,9 @@ scripts/out/
 # stores the published notes. They are not a build artifact and must never be
 # committed to the repo root. See the hermes-release skill.
 RELEASE_v*.md
+
+# 自包含 dmg 构建产物 (生成物, 勿提交)
+apps/desktop/build/hermes-runtime/
+apps/desktop/build/install-stamp.json
+*.dmg
+*.dmg.blockmap

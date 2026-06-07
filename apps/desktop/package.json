@@ -160,6 +160,10 @@
       {
         "from": "assets/icon.ico",
         "to": "icon.ico"
+      },
+      {
+        "from": "build/hermes-runtime",
+        "to": "hermes-runtime"
       }
     ],
     "asar": true,
@@ -180,10 +184,10 @@
         "NSMicrophoneUsageDescription": "Hermes uses the microphone for voice input and voice conversations."
       },
       "gatekeeperAssess": false,
-      "hardenedRuntime": true,
+      "hardenedRuntime": false,
+      "identity": null,
       "target": [
-        "dmg",
-        "zip"
+        "dmg"
       ]
     },
     "dmg": {
