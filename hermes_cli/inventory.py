@@ -96,6 +96,40 @@ def load_picker_context() -> ConfigContext:
         current_provider = ""
         current_base_url = ""
     raw = cfg.get("providers")
+
+    # Self-heal a "headless" custom endpoint: onboarding can set
+    # model.provider=custom + model.base_url WITHOUT registering a
+    # custom_providers entry, leaving the active model unselectable in the
+    # picker ("no models found") even though the endpoint exposes /v1/models
+    # (e.g. a local Ollama). Synthesize a custom_providers entry from the active
+    # config so the normal live-discovery path (cached_provider_model_ids ->
+    # fetch_api_models) lists the endpoint's models and their context lengths.
+    # Skip when an entry already covers this base_url so we never duplicate.
+    if isinstance(model_cfg, dict) and current_base_url and current_provider in ("custom", "local"):
+        existing = cfg.get("custom_providers")
+        existing_list = list(existing) if isinstance(existing, list) else []
+
+        def _norm_url(u: str) -> str:
+            return str(u or "").rstrip("/").lower()
+
+        already = any(
+            isinstance(e, dict) and _norm_url(e.get("base_url")) == _norm_url(current_base_url)
+            for e in existing_list
+        )
+        if not already:
+            api_key = str(model_cfg.get("api_key", "") or "").strip()
+            cfg = dict(cfg)
+            cfg["custom_providers"] = existing_list + [
+                {
+                    "name": "Custom endpoint",
+                    "base_url": current_base_url,
+                    # Local endpoints (Ollama / LM Studio) ignore the key; a
+                    # non-empty placeholder keeps the provider "configured" so
+                    # its discovered models render in the picker.
+                    "api_key": api_key or "local",
+                }
+            ]
+
     return ConfigContext(
         current_provider=current_provider,
         current_model=current_model,
