@@ -5655,19 +5655,15 @@ ipcMain.handle('hermes:terminal:resize', (_event, id, size = {}) => {
 })
 ipcMain.handle('hermes:terminal:dispose', (_event, id) => disposeTerminalSession(String(id || '')))
 
-ipcMain.handle('hermes:updates:check', async () => {
-  // Fork policy: the in-app self-updater is DISABLED. It rebuilds from vanilla
-  // upstream (git pull), which would silently wipe this fork's patches
-  // (bundled offline runtime, model self-heal, icon, etc.). Updates are
-  // produced by apps/desktop/scripts/build-offline-dmg.sh and distributed as a
-  // new dmg instead. Always report "up to date" so no update prompt appears.
-  return {
-    supported: false,
+ipcMain.handle('hermes:updates:check', async () =>
+  checkUpdates().catch(error => ({
+    supported: true,
     branch: readDesktopUpdateConfig().branch,
-    updateAvailable: false,
+    error: 'check-failed',
+    message: error?.message || String(error),
     fetchedAt: Date.now()
-  }
-})
+  }))
+)
 
 ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
   applyUpdates(payload || {}).catch(error => ({
