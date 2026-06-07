@@ -1,0 +1,40 @@
+name: Auto Sync Upstream (Hermes Agent)
+on:
+  schedule:
+    - cron: '0 6 * * *'  # 每天 UTC 6:00（北京时间 14:00）自动同步
+  workflow_dispatch:     # 允许手动触发（Actions 页面点 Run workflow）
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 必须给写权限才能 push
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取完整历史，才能合并
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add Upstream & Sync
+        run: |
+          # 已替换为你提供的原仓库
+          UPSTREAM_REPO="https://github.com/NousResearch/hermes-agent.git"
+          # 原仓库默认分支是 main
+          TARGET_BRANCH="main"
+
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream
+          git checkout "$TARGET_BRANCH"
+          
+          # 仅允许快进合并，避免冲突（有冲突会失败，需手动解决）
+          git merge upstream/"$TARGET_BRANCH" --ff-only || {
+            echo "❌ 合并失败（有冲突或本地有独立提交），请手动同步"
+            exit 1
+          }
+          
+          git push origin "$TARGET_BRANCH"
