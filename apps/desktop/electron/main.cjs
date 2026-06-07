@@ -2000,13 +2000,77 @@ async function installBundledRuntime(emit) {
   stage('install-deps', 'succeeded', { durationMs: Date.now() - t2 })
 
   // 4. Write the bootstrap-complete marker so isBootstrapComplete() passes and
-  //    every subsequent launch goes straight to the backend.
+  //    every subsequent launch goes straight to the backend. Also stamp the
+  //    deps-hash so a later launch can tell whether a newer bundle only
+  //    changed source (cheap refresh) or also changed deps (re-copy
+  //    site-packages). See syncBundledRuntimeIfStale().
   stage('finalize', 'running')
+  try {
+    const depsHash = fs.readFileSync(path.join(dir, '.deps-hash'), 'utf8').trim()
+    if (depsHash) fs.writeFileSync(path.join(ACTIVE_HERMES_ROOT, '.deps-hash'), depsHash, 'utf8')
+  } catch {
+    void 0
+  }
   const { commit, branch } = readBundledProvenance(dir)
   const marker = writeBootstrapMarker({ pinnedCommit: commit, pinnedBranch: branch })
   stage('finalize', 'succeeded')
   send({ type: 'complete', marker })
   return true
+}
+
+// On launch, if a NEWER bundled runtime ships with this app than the one
+// already materialized in HERMES_HOME, refresh it. Without this, a user who
+// installed an older build keeps running the stale backend source forever
+// (the bootstrap-complete check short-circuits materialization), so our fixes
+// never reach them. Source is always refreshed (cheap); site-packages only
+// when the deps-hash changed. The venv interpreter is preserved.
+function syncBundledRuntimeIfStale() {
+  try {
+    const dir = bundledRuntimeDir()
+    if (!dir) return
+    const srcRoot = path.join(dir, 'source')
+    if (!fileExists(path.join(srcRoot, 'hermes_cli', 'main.py'))) return
+    if (!isHermesSourceRoot(ACTIVE_HERMES_ROOT)) return // nothing materialized yet
+    if (!fileExists(getVenvPython(VENV_ROOT))) return // no venv -> let bootstrap handle it
+
+    const readTrim = p => {
+      try {
+        return fs.readFileSync(p, 'utf8').trim()
+      } catch {
+        return ''
+      }
+    }
+    const bundledCommit = readTrim(path.join(dir, 'COMMIT'))
+    const marker = readBootstrapMarker()
+    const installedCommit = (marker && marker.pinnedCommit) || ''
+    if (!bundledCommit || bundledCommit === installedCommit) return
+
+    rememberLog(
+      `[bundled-runtime] refreshing materialized runtime ${installedCommit.slice(0, 12)} -> ${bundledCommit.slice(0, 12)}`
+    )
+    // 1. Refresh source. The venv lives in a subdir absent from the bundle, so
+    //    cpSync overwrites/adds source files but leaves venv/ intact.
+    fs.cpSync(srcRoot, ACTIVE_HERMES_ROOT, { recursive: true })
+    // 2. If python deps changed, refresh the prebuilt site-packages too.
+    const bundledDeps = readTrim(path.join(dir, '.deps-hash'))
+    const installedDeps = readTrim(path.join(ACTIVE_HERMES_ROOT, '.deps-hash'))
+    if (bundledDeps && bundledDeps !== installedDeps) {
+      const sitePkgs = path.join(dir, 'site-packages')
+      const venvSite = path.join(VENV_ROOT, 'lib', 'python3.11', 'site-packages')
+      if (directoryExists(sitePkgs) && directoryExists(path.dirname(venvSite))) {
+        fs.rmSync(venvSite, { recursive: true, force: true })
+        fs.cpSync(sitePkgs, venvSite, { recursive: true })
+        fs.writeFileSync(path.join(ACTIVE_HERMES_ROOT, '.deps-hash'), bundledDeps, 'utf8')
+        rememberLog('[bundled-runtime] deps changed; site-packages refreshed')
+      }
+    }
+    // 3. Stamp the new version so we don't re-refresh next launch.
+    const { commit, branch } = readBundledProvenance(dir)
+    writeBootstrapMarker({ pinnedCommit: commit, pinnedBranch: branch })
+    rememberLog('[bundled-runtime] runtime refreshed to bundle version')
+  } catch (err) {
+    rememberLog(`[bundled-runtime] stale refresh failed: ${(err && err.message) || err}`)
+  }
 }
 
 function resolveWebDist() {
@@ -2155,6 +2219,10 @@ function resolveHermesBackend(dashboardArgs) {
   //    completed initial configuration; we trust the install and go straight
   //    to spawning hermes. Updates flow through the in-app update path
   //    (applyUpdates -> git pull) or `hermes update` from the CLI.
+  // Refresh an already-materialized runtime if THIS app ships a newer bundle
+  // (so our backend fixes reach users who updated the app over an old install).
+  syncBundledRuntimeIfStale()
+
   if (isBootstrapComplete()) {
     return createActiveBackend(dashboardArgs)
   }
@@ -5587,15 +5655,19 @@ ipcMain.handle('hermes:terminal:resize', (_event, id, size = {}) => {
 })
 ipcMain.handle('hermes:terminal:dispose', (_event, id) => disposeTerminalSession(String(id || '')))
 
-ipcMain.handle('hermes:updates:check', async () =>
-  checkUpdates().catch(error => ({
-    supported: true,
+ipcMain.handle('hermes:updates:check', async () => {
+  // Fork policy: the in-app self-updater is DISABLED. It rebuilds from vanilla
+  // upstream (git pull), which would silently wipe this fork's patches
+  // (bundled offline runtime, model self-heal, icon, etc.). Updates are
+  // produced by apps/desktop/scripts/build-offline-dmg.sh and distributed as a
+  // new dmg instead. Always report "up to date" so no update prompt appears.
+  return {
+    supported: false,
     branch: readDesktopUpdateConfig().branch,
-    error: 'check-failed',
-    message: error?.message || String(error),
+    updateAvailable: false,
     fetchedAt: Date.now()
-  }))
-)
+  }
+})
 
 ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
   applyUpdates(payload || {}).catch(error => ({
