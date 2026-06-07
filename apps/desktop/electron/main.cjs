@@ -2159,6 +2159,29 @@ function resolveHermesBackend(dashboardArgs) {
     return createActiveBackend(dashboardArgs)
   }
 
+  // 3.5 Self-contained build: when this app ships its own runtime under
+  //     resources/hermes-runtime, it MUST take precedence over any ambient
+  //     `hermes` on PATH or a system-python hermes_cli (step 4/5). Those
+  //     fallbacks can mis-resolve — e.g. a system Python whose import probe
+  //     passes yet fails to spawn `-m hermes_cli.main` — and short-circuit the
+  //     offline runtime we shipped. Go straight to bootstrap, which installs
+  //     the bundled runtime (installBundledRuntime) with zero network.
+  if (bundledRuntimeDir()) {
+    return {
+      kind: 'bootstrap-needed',
+      label: 'Hermes Agent bundled runtime pending install',
+      command: null,
+      args: dashboardArgs,
+      bootstrap: true,
+      env: {},
+      shell: false,
+      activeRoot: ACTIVE_HERMES_ROOT,
+      installStamp: INSTALL_STAMP,
+      isPackaged: IS_PACKAGED,
+      platform: process.platform
+    }
+  }
+
   // 4. Existing `hermes` on PATH -- installed via install.ps1 / install.sh from
   //    a previous tool-only setup, or pip-installed system-wide. Use it but
   //    do NOT write a bootstrap marker; the user did this themselves and we
