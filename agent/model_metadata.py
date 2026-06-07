@@ -1084,16 +1084,15 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
     hosting behind a reverse proxy, etc.  For non-Ollama servers the POST
     returns 404/405 quickly; the function handles errors gracefully.
 
-    For hosted servers the GGUF ``model_info.*.context_length`` is the
-    authoritative source: the user can't set their own ``num_ctx``, and the
-    OpenAI-compat ``/v1/models`` endpoint correctly omits ``context_length``
-    per the OpenAI schema.
+    Resolution order depends on WHERE the server runs:
 
-    Resolution order for hosted Ollama:
-      1. ``model_info.*.context_length`` — GGUF training max (authoritative)
-      2. ``parameters`` → ``num_ctx`` — server-side Modelfile override
-    The order is flipped vs ``query_ollama_num_ctx()`` because local users
-    control ``num_ctx`` themselves; hosted users can't.
+    * Local Ollama (localhost / LAN): the user controls ``num_ctx`` via their
+      Modelfile, and that is the context the model is ACTUALLY loaded with.
+      The GGUF ``model_info.*.context_length`` is only the architecture's
+      training max (e.g. Qwen3 reports 262144 even when the user loaded it
+      with ``num_ctx 131072``). So prefer ``num_ctx`` first, GGUF max second.
+    * Hosted Ollama (Cloud / reverse proxy): the user can't set ``num_ctx``,
+      so the GGUF ``model_info`` max is authoritative; prefer it first.
     """
     import httpx
 
@@ -1103,6 +1102,30 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
 
     headers = _auth_headers(api_key)
 
+    def _gguf_max(data) -> Optional[int]:
+        model_info = data.get("model_info", {})
+        for key, value in model_info.items():
+            if "context_length" in key and isinstance(value, (int, float)):
+                ctx = int(value)
+                if ctx >= 1024:
+                    return ctx
+        return None
+
+    def _num_ctx(data) -> Optional[int]:
+        params = data.get("parameters", "")
+        if "num_ctx" in params:
+            for line in params.split("\n"):
+                if "num_ctx" in line:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        try:
+                            ctx = int(parts[-1])
+                            if ctx >= 1024:
+                                return ctx
+                        except ValueError:
+                            pass
+        return None
+
     try:
         with httpx.Client(timeout=5.0, headers=headers) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": model})
@@ -1110,28 +1133,11 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
                 return None
             data = resp.json()
 
-            # Hosted Ollama: GGUF model_info is the real max — prefer it over
-            # num_ctx which the Cloud operator may have capped arbitrarily.
-            model_info = data.get("model_info", {})
-            for key, value in model_info.items():
-                if "context_length" in key and isinstance(value, (int, float)):
-                    ctx = int(value)
-                    if ctx >= 1024:
-                        return ctx
-
-            # Fall back to num_ctx from Modelfile parameters (rare on Cloud)
-            params = data.get("parameters", "")
-            if "num_ctx" in params:
-                for line in params.split("\n"):
-                    if "num_ctx" in line:
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            try:
-                                ctx = int(parts[-1])
-                                if ctx >= 1024:
-                                    return ctx
-                            except ValueError:
-                                pass
+            # Local users control num_ctx -> it wins. Hosted users can't ->
+            # the GGUF model_info max wins.
+            if is_local_endpoint(base_url):
+                return _num_ctx(data) or _gguf_max(data)
+            return _gguf_max(data) or _num_ctx(data)
     except Exception:
         pass
     return None

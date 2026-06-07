@@ -2064,7 +2064,16 @@ function syncBundledRuntimeIfStale() {
         rememberLog('[bundled-runtime] deps changed; site-packages refreshed')
       }
     }
-    // 3. Stamp the new version so we don't re-refresh next launch.
+    // 3. Invalidate the context-length cache. Newer runtime code may resolve
+    //    a model's context differently (e.g. the local-Ollama num_ctx fix), so
+    //    a value cached by the old code (like the GGUF architecture max) would
+    //    otherwise stick forever and mask the new result.
+    try {
+      fs.rmSync(path.join(HERMES_HOME, 'context_length_cache.yaml'), { force: true })
+    } catch {
+      void 0
+    }
+    // 4. Stamp the new version so we don't re-refresh next launch.
     const { commit, branch } = readBundledProvenance(dir)
     writeBootstrapMarker({ pinnedCommit: commit, pinnedBranch: branch })
     rememberLog('[bundled-runtime] runtime refreshed to bundle version')
