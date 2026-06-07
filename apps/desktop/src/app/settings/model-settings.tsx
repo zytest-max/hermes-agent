@@ -96,6 +96,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const [providers, setProviders] = useState<ModelOptionProvider[]>([])
   const [selectedProvider, setSelectedProvider] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
+  // Manual model id (aigen addition): when a provider returns no model list
+  // (e.g. a local Ollama / custom endpoint that doesn't expose /v1/models),
+  // the user can type the model id directly. When non-empty it OVERRIDES the
+  // dropdown selection, so official auto-discovery behavior is unchanged when
+  // this field is left blank.
+  const [manualModel, setManualModel] = useState('')
   const [auxiliary, setAuxiliary] = useState<AuxiliaryModelsResponse | null>(null)
   const [applying, setApplying] = useState(false)
   const [editingAuxTask, setEditingAuxTask] = useState<null | string>(null)
@@ -147,7 +153,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // An unconfigured provider was picked: no credentials yet, so there are no
   // models to choose. `api_key` providers can be activated inline (paste key);
   // OAuth / external flows hand off to the onboarding sign-in.
-  const needsSetup = !!selectedProvider && !isProviderReady(selectedProviderRow)
+  // aigen addition: a user-defined endpoint (e.g. a local Ollama added via the
+  // user's `providers:` config) doesn't need the API-key setup gate — the user
+  // already gave the base_url, they just need to pick/type a model. Skip the
+  // gate for these so they land on the model selector (+ manual model input).
+  const needsSetup =
+    !!selectedProvider && !isProviderReady(selectedProviderRow) && !selectedProviderRow?.is_user_defined
   const setupIsApiKey = needsSetup && selectedProviderRow?.auth_type === 'api_key' && !!selectedProviderRow?.key_env
 
   // Clear any half-typed key when switching provider so it can't leak across.
@@ -232,7 +243,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   }, [selectedProviderRow])
 
   const applyMainModel = useCallback(async () => {
-    if (!selectedProvider || !selectedModel) {
+    // Manually-typed model id wins over the dropdown selection (aigen addition).
+    const effectiveModel = manualModel.trim() || selectedModel
+    if (!selectedProvider || !effectiveModel) {
       return
     }
 
@@ -240,9 +253,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setError('')
 
     try {
-      const result = await setModelAssignment({ model: selectedModel, provider: selectedProvider, scope: 'main' })
+      const result = await setModelAssignment({ model: effectiveModel, provider: selectedProvider, scope: 'main' })
       const provider = result.provider || selectedProvider
-      const model = result.model || selectedModel
+      const model = result.model || effectiveModel
       setMainModel({ provider, model })
       setSwitchStaleAux(result.stale_aux ?? [])
       onMainModelChanged?.(provider, model)
@@ -252,7 +265,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     } finally {
       setApplying(false)
     }
-  }, [onMainModelChanged, refresh, selectedModel, selectedProvider])
+  }, [manualModel, onMainModelChanged, refresh, selectedModel, selectedProvider])
 
   const setAuxiliaryToMain = useCallback(
     async (task: string) => {
@@ -390,20 +403,31 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             )
           ) : (
             <>
-              <Select onValueChange={setSelectedModel} value={selectedModel}>
-                <SelectTrigger className={cn('min-w-60', CONTROL_TEXT)}>
-                  <SelectValue placeholder={m.model} />
-                </SelectTrigger>
-                <SelectContent>
-                  {(selectedProviderModels.length ? selectedProviderModels : []).map(model => (
-                    <SelectItem key={model} value={model}>
-                      {model}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {selectedProviderModels.length ? (
+                <Select onValueChange={setSelectedModel} value={selectedModel}>
+                  <SelectTrigger className={cn('min-w-60', CONTROL_TEXT)}>
+                    <SelectValue placeholder={m.model} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {selectedProviderModels.map(model => (
+                      <SelectItem key={model} value={model}>
+                        {model}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                // No discoverable models (e.g. local Ollama / custom endpoint):
+                // let the user type the model id directly (aigen addition).
+                <Input
+                  className={cn('min-w-60', CONTROL_TEXT)}
+                  onChange={e => setManualModel(e.target.value)}
+                  placeholder={m.model}
+                  value={manualModel}
+                />
+              )}
               <Button
-                disabled={!selectedProvider || !selectedModel || applying}
+                disabled={!selectedProvider || !(manualModel.trim() || selectedModel) || applying}
                 onClick={() => void applyMainModel()}
                 size="sm"
               >
