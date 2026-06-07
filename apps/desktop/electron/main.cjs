@@ -1345,38 +1345,68 @@ async function checkUpdates() {
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
-  // Fork policy: track RELEASE TAGS, not the daily-moving `main` HEAD. Upstream
-  // pushes commits to main every day; comparing against main HEAD would nag
-  // "update available" constantly. We only consider a real new release (a new
-  // version tag like v2026.6.5). When no tags are reachable we fall back to the
-  // branch HEAD so the updater still works against forks/branches without tags.
+  // Fork policy: notify on a new VERSION (release), not on every daily commit.
+  //
+  // Upstream pushes to `main` every day, so comparing HEAD..origin/main nagged
+  // "update available" constantly. Worse, the public release TAGS (v2026.x.x)
+  // sit on a separate history from main (they diverge by hundreds of commits),
+  // so counting commits against a tag is meaningless too. The only stable,
+  // honest signal is the release VERSION: each tag is "release vX.Y.Z" and the
+  // version at that tag is authoritative. We compare the latest release tag's
+  // version against our own app version and only flag an update when it's
+  // actually newer.
   await runGit(['fetch', '--quiet', '--tags', 'origin'], { cwd: updateRoot })
   const latestTag = (await git(['tag', '-l', 'v*', '--sort=-version:refname']))
     .split('\n')
     .map(s => s.trim())
     .filter(Boolean)[0] || ''
-  const targetRef = latestTag || `origin/${branch}`
 
-  const [currentSha, targetSha, countStr, dirtyStr, currentBranch] = await Promise.all([
+  const parseSemver = v => {
+    const m = String(v || '').match(/(\d+)\.(\d+)\.(\d+)/)
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
+  }
+  const isNewer = (a, b) => {
+    const x = parseSemver(a)
+    const y = parseSemver(b)
+    if (!x || !y) return false
+    for (let i = 0; i < 3; i++) {
+      if (x[i] > y[i]) return true
+      if (x[i] < y[i]) return false
+    }
+    return false
+  }
+
+  let releaseVersion = ''
+  if (latestTag) {
+    try {
+      const py = await git(['show', `${latestTag}:pyproject.toml`])
+      const m = py.match(/^\s*version\s*=\s*["']([^"']+)["']/m)
+      releaseVersion = m ? m[1] : ''
+    } catch {
+      releaseVersion = ''
+    }
+  }
+
+  const ourVersion = app.getVersion()
+  const updateAvailable = !!releaseVersion && isNewer(releaseVersion, ourVersion)
+  const [currentSha, dirtyStr, currentBranch] = await Promise.all([
     git(['rev-parse', 'HEAD']),
-    git(['rev-parse', targetRef]),
-    git(['rev-list', `HEAD..${targetRef}`, '--count']),
     git(['status', '--porcelain']),
     git(['rev-parse', '--abbrev-ref', 'HEAD'])
   ])
-
-  const behind = Number.parseInt(countStr, 10) || 0
-  const commits = behind > 0 ? await readCommitLog(updateRoot, targetRef) : []
 
   return {
     supported: true,
     branch,
     releaseTag: latestTag || null,
-    currentBranch,
-    behind,
+    releaseVersion: releaseVersion || null,
+    ourVersion,
+    // `behind` drives the UI's "update available" prompt; we set it from the
+    // version comparison (1 = a newer release exists, 0 = up to date).
+    behind: updateAvailable ? 1 : 0,
     currentSha,
-    targetSha,
-    commits,
+    targetSha: currentSha,
+    commits: [],
     dirty: dirtyStr.length > 0,
     hermesRoot: updateRoot,
     fetchedAt: Date.now()
